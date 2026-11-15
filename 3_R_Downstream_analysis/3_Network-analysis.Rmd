@@ -1,0 +1,797 @@
+Downstream analysis for the networks created using FastSpar.
+
+These scripts were written by Chen Xi Ye Xu as part of her Master´s Thesis 
+for UAM - Master of Bioinformatics and Computational Biology. 
+
+GEPHI INFO
+After running this code we can use the results inside Gephi to visualize the network better!
+
+In linux you download from Gephi (https://gephi.org/) the folder, unzip it, go to bin and then use ./gephi. If it doesn´t work, it is probably because you need to run chmod 777 gephi first. 
+
+Gephi accepts .tsv files!
+
+
+# Loading necessary libraries. 
+```{r}
+#We can clean up the variables. 
+rm(list = ls())
+
+#For reproducibility
+set.seed(123)
+
+#Packages available through CRAN
+cran_packages <- c(
+  "tidyverse",
+  "data.table",
+  "vegan",
+  "ggpubr",
+  "CooccurrenceAffinity",
+  "igraph",
+  "ggraph",
+  "tidygraph")
+
+#Packages available through Bioconductor
+bioc_packages <- c(
+  "microbiome",
+  "phyloseq")
+
+
+##############################################################
+##Check and install CRAN packages
+##############################################################
+missing_cran <- cran_packages[
+  !cran_packages %in% rownames(installed.packages())]
+
+if (length(missing_cran) > 0) {
+  cat(
+    "Installing missing CRAN packages:\n",
+    paste(missing_cran, collapse = ", "),
+    "\n\n")
+  install.packages(
+    missing_cran,
+    dependencies = TRUE)
+} else {
+  cat("All required CRAN packages are already installed.\n\n")}
+
+
+##############################################################
+##Check and install Bioconductor packages
+##############################################################
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  cat("BiocManager is not installed. Installing it now...\n\n")
+  install.packages("BiocManager")}
+
+missing_bioc <- bioc_packages[
+  !bioc_packages %in% rownames(installed.packages())]
+
+if (length(missing_bioc) > 0) {
+  cat(
+    "Installing missing Bioconductor packages:\n",
+    paste(missing_bioc, collapse = ", "),
+    "\n\n")
+  BiocManager::install(
+    missing_bioc,
+    ask = FALSE,
+    update = FALSE)
+} else {
+  cat("All required Bioconductor packages are already installed.\n\n")}
+
+
+##############################################################
+##Load all packages
+##############################################################
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(vegan)
+  library(microbiome)
+  library(phyloseq)
+  library(ggpubr)
+  library(CooccurrenceAffinity)
+  library(igraph)
+  library(ggraph)
+  library(tidygraph)})
+
+
+cat("All required packages were installed/loaded successfully!\n")
+```
+
+
+## 1) Setting up variables for directories and files. 
+```{r}
+##Setting up variables for the relevant directories.
+SCRIPT_DIR <- getwd()
+setwd(SCRIPT_DIR)
+
+#Results
+NETWORK_DIR <- file.path(SCRIPT_DIR, "Correlation_networks", "SparCC_results")
+FASTSPAR_R_DIR <- file.path(SCRIPT_DIR, "Correlation_networks", "R_Networks_results")
+
+#Results separated by analysis.
+WITHOUT_DIR <- file.path(FASTSPAR_R_DIR, "WITHOUT_separation")
+FEMALE_DIR <- file.path(FASTSPAR_R_DIR, "FEMALE_only")
+MALE_DIR <- file.path(FASTSPAR_R_DIR, "MALE_only")
+
+#Create output directories.
+ANALYSIS_DIRS <- c(WITHOUT_DIR, FEMALE_DIR, MALE_DIR)
+
+for (DIR in ANALYSIS_DIRS) {
+  dir.create(file.path(DIR, "Figures"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(DIR, "Tables"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(DIR, "Gephi"), recursive = TRUE, showWarnings = FALSE)}
+
+
+cat("FINISHED 1) Setting up variables for directories and files.")
+```
+
+
+## 2) Setting up the input files. 
+```{r}
+metadata <- read.table(
+  file.path(SCRIPT_DIR, "../2_Qiime2/Final_results/Rarefaction/MASTER_sample_summary.tsv"), 
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  check.names = FALSE)
+
+
+##############################################################
+## FastSpar output files: WITHOUT sex separation.
+##############################################################
+ALL_FILTERED_TSV <- file.path(NETWORK_DIR, "WITHOUT_separation", "Matrices", "abundance_matrix_genus_filtered.tsv")
+ALL_CORR_FILE <- file.path(NETWORK_DIR, "WITHOUT_separation", "correlation.tsv")
+ALL_PVAL_FILE <- file.path(NETWORK_DIR, "WITHOUT_separation", "pvalues.tsv")
+ALL_COV_FILE <- file.path(NETWORK_DIR, "WITHOUT_separation", "covariance.tsv")
+
+
+##############################################################
+## FastSpar output files: FEMALE only.
+##############################################################
+FEMALE_FILTERED_TSV <- file.path(NETWORK_DIR, "SEX_separation", "FEMALE_only", "Matrices", "abundance_matrix_genus_filtered.tsv")
+FEMALE_CORR_FILE <- file.path(NETWORK_DIR, "SEX_separation", "FEMALE_only", "correlation.tsv")
+FEMALE_PVAL_FILE <- file.path(NETWORK_DIR, "SEX_separation", "FEMALE_only", "pvalues.tsv")
+FEMALE_COV_FILE <- file.path(NETWORK_DIR, "SEX_separation", "FEMALE_only", "covariance.tsv")
+
+
+##############################################################
+## FastSpar output files: MALE only.
+##############################################################
+MALE_FILTERED_TSV <- file.path(NETWORK_DIR, "SEX_separation", "MALE_only", "Matrices", "abundance_matrix_genus_filtered.tsv")
+MALE_CORR_FILE <- file.path(NETWORK_DIR, "SEX_separation", "MALE_only", "correlation.tsv")
+MALE_PVAL_FILE <- file.path(NETWORK_DIR, "SEX_separation", "MALE_only", "pvalues.tsv")
+MALE_COV_FILE <- file.path(NETWORK_DIR, "SEX_separation", "MALE_only", "covariance.tsv")
+
+
+
+cat("FINISHED 2) Setting up the input files.")
+```
+
+
+## 3) Loading FastSpar data.
+```{r}
+#Reading FastSpar correlation and p-value matrices.
+
+
+##############################################################
+#Function to clean taxonomy names with a hierarchical fallback.
+##############################################################
+clean_tax_name <- function(x) {
+  #Split the full taxonomy string by semicolons.
+  levels <- unlist(strsplit(x, ";\\s*"))
+
+  #Names considered uninformative or unclassified.
+  uninf_terms <- c("", "uncultured", "unclassified", "unknown",
+                   "incertae_sedis", "ambiguous", "metagenome",
+                   "_", "__", "___")
+
+  #Walk backwards from genus to domain if the name is empty.
+  chosen_name <- "Unclassified"
+
+  for (lvl in rev(levels)) {
+    #Remove rank prefixes like g__, f__, o__, etc.
+    clean_val <- sub("^[a-zA-Z]+__?", "", lvl)
+    clean_val <- trimws(clean_val)
+
+    #Check if the level contains valid information.
+    if (!(tolower(clean_val) %in% uninf_terms) && clean_val != "") {
+      chosen_name <- clean_val
+      break}}
+  
+  return(chosen_name)}
+
+
+##############################################################
+## Function to read and process FastSpar matrices.
+##############################################################
+load_fastspar <- function(CORR_FILE, PVAL_FILE) {
+
+  #Reading correlation and p-value matrices.
+  cor_mat <- as.matrix(read.table(CORR_FILE, header = TRUE, row.names = 1,
+                                  sep = "\t", check.names = FALSE, comment.char = ""))
+
+  p_mat <- as.matrix(read.table(PVAL_FILE, header = TRUE, row.names = 1,
+                                sep = "\t", check.names = FALSE, comment.char = ""))
+
+
+  #Validating that dimensions and names match perfectly.
+  stopifnot(identical(rownames(cor_mat), rownames(p_mat)))
+  stopifnot(identical(colnames(cor_mat), colnames(p_mat)))
+  stopifnot(identical(rownames(cor_mat), colnames(cor_mat)))
+
+  #Apply hierarchical cleaning to taxonomy names.
+  cleaned_rownames <- sapply(rownames(cor_mat), clean_tax_name)
+
+  #Ensure uniqueness across all row/column names.
+  unique_rownames <- make.unique(cleaned_rownames, sep = "_")
+
+  rownames(cor_mat) <- unique_rownames
+  colnames(cor_mat) <- unique_rownames
+
+  rownames(p_mat) <- unique_rownames
+  colnames(p_mat) <- unique_rownames
+
+
+  #Converting correlation and p-value matrices to long format edge lists.
+  cor_df <- cor_mat %>%
+    as.data.frame(check.names = FALSE) %>%
+    tibble::rownames_to_column("Taxon1") %>%
+    tidyr::pivot_longer(-Taxon1, names_to = "Taxon2", values_to = "r")
+
+  p_df <- p_mat %>%
+    as.data.frame(check.names = FALSE) %>%
+    tibble::rownames_to_column("Taxon1") %>%
+    tidyr::pivot_longer(-Taxon1, names_to = "Taxon2", values_to = "p")
+
+
+  #Joining correlation and p-values and applying significance 
+  # and strength filters.
+  r_cutoff <- 0.2
+  p_cutoff <- 0.05
+
+  edges_raw <- cor_df %>%
+    dplyr::left_join(p_df, by = c("Taxon1", "Taxon2")) %>%
+    dplyr::filter(
+      Taxon1 < Taxon2,
+      !is.na(r),
+      !is.na(p),
+      abs(r) >= r_cutoff,
+      p <= p_cutoff
+    ) %>%
+    dplyr::mutate(sign = ifelse(r > 0, "positive", "negative"))
+
+
+  return(list(
+    cor_mat = cor_mat,
+    p_mat = p_mat,
+    cor_df = cor_df,
+    p_df = p_df,
+    edges_raw = edges_raw
+  ))}
+
+
+##############################################################
+## Process the three FastSpar analyses.
+##############################################################
+
+#WITHOUT sex separation.
+ALL_RESULTS <- load_fastspar(ALL_CORR_FILE, ALL_PVAL_FILE)
+ALL_COR_MAT <- ALL_RESULTS$cor_mat
+ALL_P_MAT <- ALL_RESULTS$p_mat
+ALL_COR_DF <- ALL_RESULTS$cor_df
+ALL_P_DF <- ALL_RESULTS$p_df
+ALL_EDGES_RAW <- ALL_RESULTS$edges_raw
+
+
+#FEMALE only.
+FEMALE_RESULTS <- load_fastspar(FEMALE_CORR_FILE, FEMALE_PVAL_FILE)
+FEMALE_COR_MAT <- FEMALE_RESULTS$cor_mat
+FEMALE_P_MAT <- FEMALE_RESULTS$p_mat
+FEMALE_COR_DF <- FEMALE_RESULTS$cor_df
+FEMALE_P_DF <- FEMALE_RESULTS$p_df
+FEMALE_EDGES_RAW <- FEMALE_RESULTS$edges_raw
+
+
+#MALE only.
+MALE_RESULTS <- load_fastspar(MALE_CORR_FILE, MALE_PVAL_FILE)
+MALE_COR_MAT <- MALE_RESULTS$cor_mat
+MALE_P_MAT <- MALE_RESULTS$p_mat
+MALE_COR_DF <- MALE_RESULTS$cor_df
+MALE_P_DF <- MALE_RESULTS$p_df
+MALE_EDGES_RAW <- MALE_RESULTS$edges_raw
+
+
+cat("FINISHED 3) Loading FastSpar data.")
+```
+
+
+## 4) Filtering weaker connections.
+```{r}
+#Filtering parameters for a more focused, robust network.
+r_cutoff <- 0.4
+
+#Threshold must use adjusted p-value.
+p_adj_cutoff <- 0.05
+
+#Apply correction to p-values and filter significant correlations.
+#   Benjamini-Hochberg = BH/fdr (more strict)
+#   Holm = holm
+
+filter_edges <- function(cor_df, p_df) {
+  #Apply multiple-testing correction.
+  p_df <- p_df %>%
+    dplyr::mutate(p_adj = p.adjust(p, method = "BH"))
+
+  #Join correlations and adjusted p-values with stricter filters.
+  edges_raw <- cor_df %>%
+    dplyr::left_join(p_df, by = c("Taxon1", "Taxon2")) %>%
+    dplyr::filter(
+      Taxon1 < Taxon2,
+      !is.na(r),
+      !is.na(p_adj),
+      abs(r) >= r_cutoff,
+      p_adj <= p_adj_cutoff
+    ) %>%
+    dplyr::mutate(sign = ifelse(r > 0, "positive", "negative"))
+
+  return(list(
+    p_df = p_df,
+    edges_raw = edges_raw
+  ))}
+
+
+##############################################################
+## Apply filtering to the three FastSpar analyses.
+##############################################################
+
+#WITHOUT sex separation.
+ALL_FILTERED_RESULTS <- filter_edges(ALL_COR_DF, ALL_P_DF)
+ALL_P_DF <- ALL_FILTERED_RESULTS$p_df
+ALL_EDGES_RAW <- ALL_FILTERED_RESULTS$edges_raw
+
+
+#FEMALE only.
+FEMALE_FILTERED_RESULTS <- filter_edges(FEMALE_COR_DF, FEMALE_P_DF)
+FEMALE_P_DF <- FEMALE_FILTERED_RESULTS$p_df
+FEMALE_EDGES_RAW <- FEMALE_FILTERED_RESULTS$edges_raw
+
+
+#MALE only.
+MALE_FILTERED_RESULTS <- filter_edges(MALE_COR_DF, MALE_P_DF)
+MALE_P_DF <- MALE_FILTERED_RESULTS$p_df
+MALE_EDGES_RAW <- MALE_FILTERED_RESULTS$edges_raw
+
+
+cat("FINISHED 4) Filtering weaker connections.")
+```
+
+
+## 5) General statistical assessment of the networks.
+```{r}
+##############################################################
+## Function to analyse the results from filtering.
+##############################################################
+diagnose_network <- function(cor_df, p_df, analysis_name) {
+
+  results <- cor_df %>%
+    dplyr::left_join(p_df, by = c("Taxon1", "Taxon2")) %>%
+    dplyr::filter(Taxon1 < Taxon2, !is.na(r), !is.na(p_adj))
+
+  cat("\n========================================\n")
+  cat("ANALYSIS:", analysis_name, "\n")
+  cat("========================================\n")
+
+  cat("Total unique taxon pairs:", nrow(results), "\n")
+
+  if (nrow(results) == 0) {
+    cat("No valid taxon pairs available for assessment.\n")
+    return(invisible(NULL))}
+
+  cat("Pairs with |r| >=", r_cutoff, ":",
+      sum(abs(results$r) >= r_cutoff), "\n")
+
+  cat("Pairs with adjusted p <=", p_adj_cutoff, ":",
+      sum(results$p_adj <= p_adj_cutoff), "\n")
+
+  cat("Pairs passing both thresholds:",
+      sum(abs(results$r) >= r_cutoff &
+          results$p_adj <= p_adj_cutoff), "\n")
+
+  cat("Pairs with raw p <= 0.05:",
+      sum(results$p <= 0.05), "\n")
+
+  cat("Maximum absolute correlation:",
+      max(abs(results$r), na.rm = TRUE), "\n")
+
+  cat("Minimum adjusted p-value:",
+      min(results$p_adj, na.rm = TRUE), "\n")}
+
+
+##############################################################
+## Assess the three FastSpar analyses.
+##############################################################
+
+#WITHOUT sex separation.
+diagnose_network(ALL_COR_DF, ALL_P_DF, "ALL")
+
+#FEMALE only.
+diagnose_network(FEMALE_COR_DF, FEMALE_P_DF, "FEMALE")
+
+#MALE only.
+diagnose_network(MALE_COR_DF, MALE_P_DF, "MALE")
+
+
+cat("FINISHED 5) General statistical assessment of the networks.\n")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## 6) Creating node and edge tables for Gephi export and network construction.
+```{r}
+##############################################################
+## Function to format edge tables.
+##############################################################
+make_edges <- function(edges_raw) {
+
+  edges_all <- data.frame(
+    Source = edges_raw$Taxon1,
+    Target = edges_raw$Taxon2,
+    Type = rep("Undirected", nrow(edges_raw)),
+    Weight = round(abs(edges_raw$r), 6),
+    r = round(edges_raw$r, 6),
+    p = signif(edges_raw$p, 6),
+    p_adj = signif(edges_raw$p_adj, 6),
+    sign = edges_raw$sign,
+    stringsAsFactors = FALSE)
+
+  #Splitting into positive and negative edge subsets.
+  edges_pos <- dplyr::filter(edges_all, sign == "positive")
+  edges_neg <- dplyr::filter(edges_all, sign == "negative")
+
+  return(list(
+    edges_all = edges_all,
+    edges_pos = edges_pos,
+    edges_neg = edges_neg
+  ))}
+
+
+##############################################################
+## Function to calculate node degrees and strengths dynamically.
+##############################################################
+make_nodes <- function(edges_df) {
+
+  if (nrow(edges_df) == 0) {
+    return(data.frame(
+      Id = character(),
+      Label = character(),
+      Degree = integer(),
+      Strength = numeric(),
+      stringsAsFactors = FALSE
+    ))}
+
+  nds <- unique(c(edges_df$Source, edges_df$Target))
+  deg <- table(c(edges_df$Source, edges_df$Target))
+  str <- tapply(rep(edges_df$Weight, 2),
+                c(edges_df$Source, edges_df$Target), sum)
+
+  out <- data.frame(
+    Id = nds,
+    Label = nds,
+    Degree = as.integer(deg[nds]),
+    Strength = round(as.numeric(str[nds]), 6),
+    stringsAsFactors = FALSE)
+
+  out$Degree[is.na(out$Degree)] <- 0L
+  out$Strength[is.na(out$Strength)] <- 0
+
+  return(out)}
+
+
+##############################################################
+## Generate edge and node tables for each analysis.
+##############################################################
+
+#WITHOUT sex separation.
+ALL_EDGES <- make_edges(ALL_EDGES_RAW)
+
+ALL_EDGES_ALL <- ALL_EDGES$edges_all
+ALL_EDGES_POS <- ALL_EDGES$edges_pos
+ALL_EDGES_NEG <- ALL_EDGES$edges_neg
+
+ALL_NODES_ALL <- make_nodes(ALL_EDGES_ALL)
+ALL_NODES_POS <- make_nodes(ALL_EDGES_POS)
+ALL_NODES_NEG <- make_nodes(ALL_EDGES_NEG)
+
+
+#FEMALE only.
+FEMALE_EDGES <- make_edges(FEMALE_EDGES_RAW)
+
+FEMALE_EDGES_ALL <- FEMALE_EDGES$edges_all
+FEMALE_EDGES_POS <- FEMALE_EDGES$edges_pos
+FEMALE_EDGES_NEG <- FEMALE_EDGES$edges_neg
+
+FEMALE_NODES_ALL <- make_nodes(FEMALE_EDGES_ALL)
+FEMALE_NODES_POS <- make_nodes(FEMALE_EDGES_POS)
+FEMALE_NODES_NEG <- make_nodes(FEMALE_EDGES_NEG)
+
+
+#MALE only.
+MALE_EDGES <- make_edges(MALE_EDGES_RAW)
+
+MALE_EDGES_ALL <- MALE_EDGES$edges_all
+MALE_EDGES_POS <- MALE_EDGES$edges_pos
+MALE_EDGES_NEG <- MALE_EDGES$edges_neg
+
+MALE_NODES_ALL <- make_nodes(MALE_EDGES_ALL)
+MALE_NODES_POS <- make_nodes(MALE_EDGES_POS)
+MALE_NODES_NEG <- make_nodes(MALE_EDGES_NEG)
+
+
+##############################################################
+## Summary of generated node and edge tables.
+##############################################################
+message("WITHOUT separation - Total edges: ", nrow(ALL_EDGES_ALL),
+        " | Positive: ", nrow(ALL_EDGES_POS),
+        " | Negative: ", nrow(ALL_EDGES_NEG))
+
+message("FEMALE only - Total edges: ", nrow(FEMALE_EDGES_ALL),
+        " | Positive: ", nrow(FEMALE_EDGES_POS),
+        " | Negative: ", nrow(FEMALE_EDGES_NEG))
+
+message("MALE only - Total edges: ", nrow(MALE_EDGES_ALL),
+        " | Positive: ", nrow(MALE_EDGES_POS),
+        " | Negative: ", nrow(MALE_EDGES_NEG))
+
+
+cat("FINISHED 6) Creating node and edge tables for Gephi export and network construction.\n")
+```
+
+
+## 7) Exporting edge and node tables for all, positive and negative networks.
+```{r}
+##############################################################
+## Function to export edge and node tables.
+##############################################################
+export_gephi <- function(EDGES_ALL, EDGES_POS, EDGES_NEG,
+                         NODES_ALL, NODES_POS, NODES_NEG, GEPHI_DIR) {
+
+  #Creating subdirectories inside the Gephi folder.
+  dir.create(file.path(GEPHI_DIR, "All"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(GEPHI_DIR, "Positive"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(GEPHI_DIR, "Negative"), recursive = TRUE, showWarnings = FALSE)
+
+  #Writing edge tables to Gephi folder.
+  write.table(EDGES_ALL, file.path(GEPHI_DIR, "All", "fastspar_genus_edges_all.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  write.table(EDGES_POS, file.path(GEPHI_DIR, "Positive", "fastspar_genus_edges_positive.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  write.table(EDGES_NEG, file.path(GEPHI_DIR, "Negative", "fastspar_genus_edges_negative.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  #Writing node tables to Gephi folder.
+  write.table(NODES_ALL, file.path(GEPHI_DIR, "All", "fastspar_genus_nodes_all.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  write.table(NODES_POS, file.path(GEPHI_DIR, "Positive", "fastspar_genus_nodes_positive.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  write.table(NODES_NEG, file.path(GEPHI_DIR, "Negative", "fastspar_genus_nodes_negative.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  message("Gephi tables successfully exported to: ", GEPHI_DIR)}
+
+
+##############################################################
+## Export WITHOUT sex separation.
+##############################################################
+export_gephi(
+  ALL_EDGES_ALL, ALL_EDGES_POS, ALL_EDGES_NEG,
+  ALL_NODES_ALL, ALL_NODES_POS, ALL_NODES_NEG,
+  file.path(WITHOUT_DIR, "Gephi"))
+
+
+##############################################################
+## Export FEMALE only.
+##############################################################
+export_gephi(
+  FEMALE_EDGES_ALL, FEMALE_EDGES_POS, FEMALE_EDGES_NEG,
+  FEMALE_NODES_ALL, FEMALE_NODES_POS, FEMALE_NODES_NEG,
+  file.path(FEMALE_DIR, "Gephi"))
+
+
+##############################################################
+## Export MALE only.
+##############################################################
+export_gephi(
+  MALE_EDGES_ALL, MALE_EDGES_POS, MALE_EDGES_NEG,
+  MALE_NODES_ALL, MALE_NODES_POS, MALE_NODES_NEG,
+  file.path(MALE_DIR, "Gephi"))
+
+
+cat("FINISHED 7) Exporting edge and node tables for all, positive and negative networks.\n")
+```
+
+
+## 8) Plotting correlation networks.
+```{r}
+##############################################################
+## Function to plot correlation networks using ggraph.
+##############################################################
+plot_correlation_network <- function(edges_out, title, outfile_prefix) {
+  for (sign_label in c("positive", "negative")) {
+    edges_sub <- subset(edges_out, sign == sign_label)
+
+    if (nrow(edges_sub) == 0) {
+      message("No ", sign_label, " edges to plot: ", outfile_prefix)
+      next}
+
+    nodes_sub <- tibble::tibble(
+      name = unique(c(edges_sub$Source, edges_sub$Target)),
+      label = unique(c(edges_sub$Source, edges_sub$Target)))
+
+    g <- igraph::graph_from_data_frame(
+      d = edges_sub[, c("Source", "Target", "r", "Weight")],
+      vertices = nodes_sub,
+      directed = FALSE)
+
+    V(g)$degree <- igraph::degree(g)
+    g_tbl <- tidygraph::as_tbl_graph(g)
+
+    edge_color <- if (sign_label == "positive") "firebrick3" else "steelblue3"
+
+    p <- ggraph::ggraph(g_tbl, layout = "fr") +
+      ggraph::geom_edge_link(aes(width = Weight), color = edge_color, alpha = 0.4) +
+      ggraph::scale_edge_width(range = c(0.2, 2), guide = "none") +
+      ggraph::geom_node_point(aes(size = degree), color = "grey20", alpha = 0.9) +
+      ggplot2::scale_size_continuous(range = c(2, 8), guide = "none") +
+      ggraph::geom_node_text(aes(label = label), size = 2.5, repel = TRUE, max.overlaps = Inf) +
+      ggraph::theme_graph() +
+      ggplot2::labs(title = title, subtitle = paste(sign_label, "correlations"))
+
+    outfile <- paste0(outfile_prefix, "_", sign_label, ".png")
+
+    ggplot2::ggsave(outfile, plot = p, width = 10, height = 10, dpi = 300)
+
+    message("Figure saved: ", outfile)
+  }}
+
+
+##############################################################
+## Plot WITHOUT sex separation.
+##############################################################
+plot_correlation_network(
+  edges_out = ALL_EDGES_ALL,
+  title = "FastSpar Genus Correlation Network - All Samples",
+  outfile_prefix = file.path(WITHOUT_DIR, "Figures", "fastspar_genus"))
+
+
+##############################################################
+## Plot FEMALE only.
+##############################################################
+plot_correlation_network(
+  edges_out = FEMALE_EDGES_ALL,
+  title = "FastSpar Genus Correlation Network - Female",
+  outfile_prefix = file.path(FEMALE_DIR, "Figures", "fastspar_genus"))
+
+
+##############################################################
+## Plot MALE only.
+##############################################################
+plot_correlation_network(
+  edges_out = MALE_EDGES_ALL,
+  title = "FastSpar Genus Correlation Network - Male",
+  outfile_prefix = file.path(MALE_DIR, "Figures", "fastspar_genus"))
+
+
+cat("FINISHED 8) Plotting correlation networks.\n")
+```
+
+
+## 9) Plot the network interactively in R!
+```{r}
+#Select the analysis here: "ALL", "FEMALE" or "MALE".
+analysis_type <- "MALE"
+
+#Select the correlation sign here: "positive" or "negative".
+sign_type <- "negative"
+
+
+##############################################################
+## Select the corresponding edge table.
+##############################################################
+edges_selected <- switch(
+  analysis_type,
+  "ALL" = ALL_EDGES_ALL,
+  "FEMALE" = FEMALE_EDGES_ALL,
+  "MALE" = MALE_EDGES_ALL,
+  stop("Invalid analysis_type. Choose ALL, FEMALE or MALE!!"))
+
+edges_sub <- subset(edges_selected, sign == sign_type)
+
+
+##############################################################
+## Prepare network data.
+##############################################################
+if (nrow(edges_sub) == 0) {
+  stop("No ", sign_type, " edges available for ", analysis_type, " analysis.")}
+
+#Function to strip all higher taxonomy levels and prefixes (e.g., g__).
+clean_tax_name <- function(x) {
+  x <- sub(".*;\\s*", "", x)
+  x <- sub("^[a-zA-Z]+__?", "", x)
+  return(x)}
+
+#Clean Source and Target columns.
+edges_sub$Source <- clean_tax_name(edges_sub$Source)
+edges_sub$Target <- clean_tax_name(edges_sub$Target)
+
+nodes_sub <- tibble::tibble(
+  name = unique(c(edges_sub$Source, edges_sub$Target)),
+  label = unique(c(edges_sub$Source, edges_sub$Target)))
+
+g <- igraph::graph_from_data_frame(
+  d = edges_sub[, c("Source", "Target", "r", "Weight")],
+  vertices = nodes_sub,
+  directed = FALSE)
+
+V(g)$degree <- igraph::degree(g)
+g_tbl <- tidygraph::as_tbl_graph(g)
+
+
+##############################################################
+## Plot network interactively in RStudio.
+##############################################################
+
+#Dynamic styling and labels based on selected analysis and sign.
+edge_color <- if (sign_type == "positive") "firebrick3" else "steelblue3"
+
+net_title <- paste0(
+  "FastSpar ",
+  tools::toTitleCase(analysis_type),
+  " ",
+  tools::toTitleCase(sign_type),
+  " Correlation Network")
+
+net_sub <- paste(analysis_type, sign_type, "correlations at genus level")
+
+#Render the plot directly in the RStudio plot window.
+ggraph::ggraph(g_tbl, layout = "fr") +
+  ggraph::geom_edge_link(aes(width = Weight), color = edge_color, alpha = 0.4) +
+  ggraph::scale_edge_width(range = c(0.2, 2), guide = "none") +
+  ggraph::geom_node_point(aes(size = degree), color = "grey20", alpha = 0.9) +
+  ggplot2::scale_size_continuous(range = c(2, 8), guide = "none") +
+  ggraph::geom_node_text(aes(label = label), size = 2.5, repel = TRUE, max.overlaps = Inf) +
+  ggraph::theme_graph() +
+  ggplot2::labs(title = net_title, subtitle = net_sub)
+
+
+cat("FINISHED 9) Plotting the network interactively in RStudio!\n")
+```
+
+
+## 10) Saving workspace image
+```{r}
+#Saving final workspace image
+save.image(file = file.path(FASTSPAR_R_DIR, "R_network_fastspar.RData"))
+
+cat("FINISHED 10) Saving workspace image.\n")
+```
+
+
+
+
+
+
+
